@@ -22,6 +22,22 @@ logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("tech")
 
+
+_SVC_NAMES = {
+    0x0201: "SEARCH_REQ",     0x0202: "SEARCH_RESP",
+    0x0203: "DESC_REQ",       0x0204: "DESC_RESP",
+    0x0205: "CONNECT_REQ",    0x0206: "CONNECT_RESP",
+    0x0207: "CONNSTATE_REQ",  0x0208: "CONNSTATE_RESP",
+    0x0209: "DISCONNECT_REQ", 0x020A: "DISCONNECT_RESP",
+    0x0420: "TUNNELING_REQ",  0x0421: "TUNNELING_ACK",
+}
+
+def _svc_name(data: bytes) -> str:
+    if len(data) >= 6 and data[0] == 0x06 and data[1] == 0x10:
+        svc = (data[2] << 8) | data[3]
+        return _SVC_NAMES.get(svc, f"0x{svc:04X}")
+    return "?"
+
 # ── Konfiguration ────────────────────────────────────────────────────────────
 RELAY_SERVER = "wss://knx.hilli86.at"
 LOCAL_KNX_PORT = 3671   # ETS verbindet sich auf diesen Port
@@ -55,16 +71,23 @@ class LocalKNXServer:
             try:
                 data, addr = self.sock.recvfrom(4096)
                 self.ets_addr = addr   # Merken für Antworten
+                log.info(f"ETS → Tunnel ({addr[0]}:{addr[1]}): "
+                         f"{_svc_name(data)} ({len(data)} B)")
                 import base64
                 encoded = base64.b64encode(data).decode()
-                asyncio.run_coroutine_threadsafe(
-                    self.ws_send(json.dumps({
-                        "type": "knx_packet",
-                        "data": encoded,
-                        "source": "tech"
-                    })),
-                    loop
+                msg = json.dumps({
+                    "type": "knx_packet",
+                    "data": encoded,
+                    "source": "tech"
+                })
+                future = asyncio.run_coroutine_threadsafe(
+                    self.ws_send(msg), loop
                 )
+                try:
+                    future.result(timeout=5.0)
+                    log.info(f"  → WS send OK ({len(msg)} chars)")
+                except Exception as e:
+                    log.error(f"  → WS send FAILED: {type(e).__name__}: {e}")
             except socket.timeout:
                 continue
             except Exception as e:
@@ -77,8 +100,13 @@ class LocalKNXServer:
         if not self.ets_addr:
             log.warning("ETS hat noch keine Pakete gesendet – Adresse unbekannt")
             return
-        data = base64.b64decode(data_b64)
-        self.sock.sendto(data, self.ets_addr)
+        try:
+            data = base64.b64decode(data_b64)
+            log.info(f"Tunnel → ETS ({self.ets_addr[0]}:{self.ets_addr[1]}): "
+                     f"{_svc_name(data)} ({len(data)} B)")
+            self.sock.sendto(data, self.ets_addr)
+        except Exception as e:
+            log.error(f"send_to_ets: {e}", exc_info=True)
 
     def stop(self):
         self.running = False
@@ -97,7 +125,7 @@ class TechApp:
     def _setup_gui(self):
         self.root = tk.Tk()
         self.root.title("KNX Remote Access – Techniker")
-        self.root.geometry("480x420")
+        self.root.geometry("480x520")
         self.root.resizable(False, False)
         self.root.configure(bg="#0f3460")
 
@@ -105,7 +133,40 @@ class TechApp:
         code_font = tkfont.Font(family="Courier", size=28, weight="bold")
         label_font = tkfont.Font(family="Helvetica", size=11)
         small_font = tkfont.Font(family="Helvetica", size=9)
+        hint_font = tkfont.Font(family="Helvetica", size=10)
         input_font = tkfont.Font(family="Courier", size=26, weight="bold")
+
+        # Unterer Bereich zuerst packen (fester Platz für Button + Hinweise)
+        bottom_area = tk.Frame(self.root, bg="#0f3460")
+        bottom_area.pack(side="bottom", fill="x", padx=30, pady=(0, 12))
+
+        self.disconnect_btn = tk.Button(
+            bottom_area, text="Trennen",
+            command=self._disconnect,
+            bg="#333", fg="#a8a8b3",
+            font=label_font, relief="flat",
+            padx=20, pady=8, cursor="hand2",
+            state="disabled",
+        )
+        self.disconnect_btn.pack(pady=(0, 10))
+
+        footer = tk.Frame(bottom_area, bg="#0f3460")
+        footer.pack(fill="x")
+
+        self.ets_info = tk.Label(
+            footer,
+            text="Nach Verbindung → ETS: IP-Tunneling auf 127.0.0.1:3671",
+            font=hint_font, bg="#0f3460", fg="#a8a8b3",
+            pady=4,
+        )
+        self.ets_info.pack()
+
+        tk.Label(
+            footer,
+            text=f"Server: {RELAY_SERVER}",
+            font=hint_font, bg="#0f3460", fg="#8899aa",
+            pady=2,
+        ).pack()
 
         # Header
         header = tk.Frame(self.root, bg="#16213e", pady=15)
@@ -116,7 +177,7 @@ class TechApp:
                  font=small_font, bg="#16213e", fg="#a8a8b3").pack()
 
         # Code Eingabe
-        input_frame = tk.Frame(self.root, bg="#0f3460", pady=25)
+        input_frame = tk.Frame(self.root, bg="#0f3460", pady=20)
         input_frame.pack(fill="x", padx=30)
 
         tk.Label(input_frame, text="Verbindungscode eingeben",
@@ -128,7 +189,8 @@ class TechApp:
         entry_frame.pack(pady=12)
 
         self.code_var = tk.StringVar()
-        self.code_var.trace("w", self._on_code_change)
+        self._suppress_code_trace = False
+        self.code_var.trace_add("write", self._on_code_change)
 
         vcmd = (self.root.register(self._validate_code), "%P")
         self.code_entry = tk.Entry(
@@ -159,46 +221,25 @@ class TechApp:
         )
         self.connect_btn.pack(pady=5)
 
-        # Status
-        status_frame = tk.Frame(self.root, bg="#16213e", pady=12, padx=20)
-        status_frame.pack(fill="x", padx=30, pady=15)
+        # Status (feste Mindesthöhe, sonst wird der Text auf Windows abgeschnitten)
+        status_frame = tk.Frame(self.root, bg="#16213e", padx=20)
+        status_frame.pack(fill="x", padx=30, pady=(10, 0))
 
-        self.status_dot = tk.Label(status_frame, text="●",
-                                   bg="#16213e", fg="#555", font=("Helvetica", 16))
-        self.status_dot.pack(side="left")
+        status_inner = tk.Frame(status_frame, bg="#16213e", height=44)
+        status_inner.pack(fill="x")
+        status_inner.pack_propagate(False)
+
+        self.status_dot = tk.Label(
+            status_inner, text="●",
+            bg="#16213e", fg="#555", font=label_font,
+        )
+        self.status_dot.pack(side="left", padx=(0, 8), pady=10)
 
         self.status_label = tk.Label(
-            status_frame, text="  Bereit",
-            font=label_font, bg="#16213e", fg="#a8a8b3"
+            status_inner, text="Bereit",
+            font=label_font, bg="#16213e", fg="#a8a8b3",
         )
-        self.status_label.pack(side="left")
-
-        # ETS Hinweis
-        ets_frame = tk.Frame(self.root, bg="#0f3460", pady=5)
-        ets_frame.pack(fill="x", padx=30)
-
-        self.ets_info = tk.Label(
-            ets_frame,
-            text="Nach Verbindung → ETS: IP-Tunneling auf 127.0.0.1:3671",
-            font=small_font, bg="#0f3460", fg="#555"
-        )
-        self.ets_info.pack()
-
-        # Trennen Button
-        self.disconnect_btn = tk.Button(
-            self.root, text="Trennen",
-            command=self._disconnect,
-            bg="#333", fg="#a8a8b3",
-            font=small_font, relief="flat",
-            padx=15, pady=6, cursor="hand2",
-            state="disabled"
-        )
-        self.disconnect_btn.pack(pady=5)
-
-        tk.Label(self.root,
-                 text=f"Server: {RELAY_SERVER}",
-                 font=small_font, bg="#0f3460", fg="#333").pack(
-            side="bottom", pady=5)
+        self.status_label.pack(side="left", pady=10)
 
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self.root.bind("<Return>", lambda e: self._connect())
@@ -211,19 +252,29 @@ class TechApp:
         return all(c in allowed for c in value)
 
     def _on_code_change(self, *args):
+        if self._suppress_code_trace:
+            return
         val = self.code_var.get()
-        # Auto-Bindestrich nach 3 Ziffern
-        digits = val.replace("-", "")
-        if len(digits) >= 3 and "-" not in val:
-            self.code_var.set(digits[:3] + "-" + digits[3:])
-            self.code_entry.icursor(tk.END)
+        digits = val.replace("-", "")[:6]
+        if len(digits) >= 3:
+            formatted = digits[:3] + "-" + digits[3:]
+        else:
+            formatted = digits
+
+        if formatted != val:
+            self._suppress_code_trace = True
+            self.code_var.set(formatted)
+            self._suppress_code_trace = False
+            cursor = len(formatted)
+            self.root.after_idle(
+                lambda c=cursor: self.code_entry.icursor(c))
 
         clean = self.code_var.get()
         ready = len(clean) == 7 and clean[3] == "-"
         self.connect_btn.config(state="normal" if ready else "disabled")
 
     def _set_status(self, text: str, color: str, dot_color: str):
-        self.status_label.config(text=f"  {text}", fg=color)
+        self.status_label.config(text=text, fg=color)
         self.status_dot.config(fg=dot_color)
 
     def _connect(self):
@@ -281,31 +332,40 @@ class TechApp:
                                 "#e94560", "#e94560"))
 
                     elif t == "knx_packet" and self.server:
-                        self.server.send_to_ets(msg["data"])
+                        try:
+                            self.server.send_to_ets(msg["data"])
+                        except Exception as e:
+                            log.error(f"knx_packet weiterleitung: {e}")
 
                     elif t == "disconnected":
+                        log.warning("Relay meldet: Verbindung getrennt (disconnected)")
                         self.root.after(0, lambda: self._set_status(
                             "Kunde hat getrennt", "#f0a500", "#f0a500"))
                         break
 
                     elif t == "error":
                         err = msg.get("message", "Unbekannter Fehler")
+                        log.error(f"Relay-Fehler: {err}")
                         self.root.after(0, lambda e=err: self._set_status(
                             f"Fehler: {e}", "#e94560", "#e94560"))
                         break
 
+                    else:
+                        log.info(f"WS Nachricht type={t!r}")
+
         except Exception as e:
-            log.error(f"Verbindungsfehler: {e}")
+            log.error(f"Verbindungsfehler: {type(e).__name__}: {e}", exc_info=True)
             self.root.after(0, lambda: self._set_status(
                 f"Fehler: {e}", "#e94560", "#e94560"))
         finally:
+            log.info("WebSocket-Schleife beendet")
             self.connected = False
             if self.server:
                 self.server.stop()
             self.root.after(0, lambda: self.connect_btn.config(state="normal"))
             self.root.after(0, lambda: self.code_entry.config(state="normal"))
             self.root.after(0, lambda: self.disconnect_btn.config(state="disabled"))
-            self.root.after(0, lambda: self.ets_info.config(fg="#555"))
+            self.root.after(0, lambda: self.ets_info.config(fg="#a8a8b3"))
 
 
 def run_async_loop(loop_ref):

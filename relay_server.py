@@ -176,10 +176,17 @@ async def relay(sender, receiver, code: str, role: str):
         async for message in sender:
             if code not in sessions:
                 break
-            if receiver and not receiver.closed:
+            if receiver is None:
+                log.warning(f"Empfänger nicht vorhanden für Code {code}")
+                break
+            try:
                 await receiver.send(message)
-            else:
-                log.warning(f"Empfänger nicht verfügbar für Code {code}")
+            except websockets.exceptions.ConnectionClosed:
+                log.warning(f"Empfänger geschlossen ({role}) für Code {code}")
+                break
+            except Exception as e:
+                log.error(f"Relay-Send Fehler ({role}, Code {code}): "
+                          f"{type(e).__name__}: {e}")
                 break
     except websockets.exceptions.ConnectionClosed:
         log.info(f"Relay beendet ({role}) für Code {code}")
